@@ -1,0 +1,1 @@
+**AI Agents**: See [.github/AGENTS.md](.github/AGENTS.md) for codebase guidance.
