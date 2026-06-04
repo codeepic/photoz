@@ -2,29 +2,199 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Upload Photo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; color: #1f2933; }
+    h2 { margin-top: 0; }
+    .card { max-width: 560px; border: 1px solid #d9e2ec; border-radius: 8px; padding: 1.25rem; }
+    .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem 1rem; margin: 1rem 0; }
+    .controls label { display: flex; flex-direction: column; font-size: 0.85rem; gap: 0.25rem; }
+    .controls input[type="number"] { padding: 0.35rem; }
+    .full { grid-column: 1 / -1; }
+    .checkbox-row { flex-direction: row; align-items: center; gap: 0.5rem; }
+    .preview { display: flex; gap: 1rem; margin: 1rem 0; flex-wrap: wrap; }
+    .preview img { max-width: 240px; max-height: 200px; border: 1px solid #d9e2ec; border-radius: 4px; }
+    .stats { font-size: 0.85rem; line-height: 1.5; }
+    .stats b { color: #243b53; }
+    button { padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #2680c2; color: #fff; cursor: pointer; font-size: 0.9rem; }
+    button:disabled { background: #9fb3c8; cursor: not-allowed; }
+    #status { margin-top: 0.75rem; font-size: 0.9rem; min-height: 1.2em; }
+    .muted { color: #627d98; }
+  </style>
 </head>
 <body>
-  <h2>Photo Upload</h2>
+  <div class="card">
+    <h2>Photo Upload</h2>
 
-  <input id="fileupload" type="file" name="fileupload" />
-  <button id="upload-button" onclick="uploadFile()">Upload</button>
+    <input id="fileupload" type="file" accept="image/*" name="fileupload" />
+
+    <div class="controls">
+      <label>
+        Max width (px)
+        <input id="maxWidth" type="number" min="1" value="1280" />
+      </label>
+      <label>
+        Max height (px)
+        <input id="maxHeight" type="number" min="1" value="1280" />
+      </label>
+      <label>
+        JPEG/WebP quality
+        <input id="quality" type="range" min="0.1" max="1" step="0.05" value="0.8" />
+        <span id="qualityValue" class="muted">0.80</span>
+      </label>
+      <label class="checkbox-row">
+        <input id="keepAspect" type="checkbox" checked />
+        Keep aspect ratio
+      </label>
+    </div>
+
+    <div class="preview" id="preview" hidden>
+      <img id="previewImg" alt="preview" />
+      <div class="stats">
+        <div>Original: <b id="origDims">-</b> &middot; <span id="origSize">-</span></div>
+        <div>Resized: <b id="newDims">-</b> &middot; <span id="newSize">-</span></div>
+        <div id="savings" class="muted"></div>
+      </div>
+    </div>
+
+    <button id="upload-button" onclick="uploadFile()" disabled>Upload</button>
+    <div id="status"></div>
+  </div>
 
   <script>
-    async function uploadFile() {
-      let formData = new FormData();
-      formData.append("data", document.getElementById("fileupload").files[0]);
+    const fileInput = document.getElementById("fileupload");
+    const maxWidthInput = document.getElementById("maxWidth");
+    const maxHeightInput = document.getElementById("maxHeight");
+    const qualityInput = document.getElementById("quality");
+    const qualityValue = document.getElementById("qualityValue");
+    const keepAspectInput = document.getElementById("keepAspect");
+    const uploadButton = document.getElementById("upload-button");
+    const statusEl = document.getElementById("status");
 
-      await fetch("http://localhost:8080/photos", {
-        method: "POST",
-        body: formData
-      })
-        .then(res => res.text())
-        .then(res => {
-          console.log(res);
-        })
+    let selectedFile = null;   // original File
+    let resizedBlob = null;    // Blob to upload (resized, or original if no resize)
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+      return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+    }
+
+    function computeTargetSize(width, height, maxW, maxH, keepAspect) {
+      if (!keepAspect) {
+        return { width: maxW || width, height: maxH || height };
+      }
+      // Scale down only; never upscale beyond the original.
+      const ratio = Math.min(maxW / width, maxH / height, 1);
+      return { width: Math.max(1, Math.round(width * ratio)), height: Math.max(1, Math.round(height * ratio)) };
+    }
+
+    function loadImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not read image")); };
+        img.src = url;
+      });
+    }
+
+    async function regeneratePreview() {
+      if (!selectedFile) return;
+      statusEl.textContent = "";
+
+      let img;
+      try {
+        img = await loadImage(selectedFile);
+      } catch (e) {
+        // Not a decodable image: fall back to uploading the original as-is.
+        resizedBlob = selectedFile;
+        document.getElementById("preview").hidden = true;
+        uploadButton.disabled = false;
+        return;
+      }
+
+      const maxW = parseInt(maxWidthInput.value, 10) || img.naturalWidth;
+      const maxH = parseInt(maxHeightInput.value, 10) || img.naturalHeight;
+      const quality = parseFloat(qualityInput.value);
+      const target = computeTargetSize(img.naturalWidth, img.naturalHeight, maxW, maxH, keepAspectInput.checked);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = target.width;
+      canvas.height = target.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, target.width, target.height);
+
+      // Preserve the original format so the filename/extension stays valid.
+      const outputType = (selectedFile.type && selectedFile.type.startsWith("image/")) ? selectedFile.type : "image/jpeg";
+
+      resizedBlob = await new Promise((resolve) => canvas.toBlob(resolve, outputType, quality));
+      if (!resizedBlob) resizedBlob = selectedFile;
+
+      document.getElementById("preview").hidden = false;
+      document.getElementById("previewImg").src = canvas.toDataURL(outputType, quality);
+      document.getElementById("origDims").textContent = img.naturalWidth + " x " + img.naturalHeight;
+      document.getElementById("origSize").textContent = formatBytes(selectedFile.size);
+      document.getElementById("newDims").textContent = target.width + " x " + target.height;
+      document.getElementById("newSize").textContent = formatBytes(resizedBlob.size);
+
+      const saved = selectedFile.size - resizedBlob.size;
+      const savingsEl = document.getElementById("savings");
+      if (saved > 0) {
+        savingsEl.textContent = "Saves " + formatBytes(saved) + " (" + Math.round((saved / selectedFile.size) * 100) + "%)";
+      } else {
+        savingsEl.textContent = "No size reduction for these settings";
+      }
+
+      uploadButton.disabled = false;
+    }
+
+    fileInput.addEventListener("change", () => {
+      selectedFile = fileInput.files[0] || null;
+      resizedBlob = null;
+      uploadButton.disabled = true;
+      if (selectedFile) {
+        regeneratePreview();
+      } else {
+        document.getElementById("preview").hidden = true;
+      }
+    });
+
+    qualityInput.addEventListener("input", () => {
+      qualityValue.textContent = parseFloat(qualityInput.value).toFixed(2);
+    });
+
+    [maxWidthInput, maxHeightInput, qualityInput, keepAspectInput].forEach((el) => {
+      el.addEventListener("change", regeneratePreview);
+    });
+
+    async function uploadFile() {
+      const blobToUpload = resizedBlob || selectedFile;
+      if (!blobToUpload) {
+        statusEl.textContent = "Please choose a file first.";
+        return;
+      }
+
+      uploadButton.disabled = true;
+      statusEl.textContent = "Uploading " + formatBytes(blobToUpload.size) + "...";
+
+      const formData = new FormData();
+      formData.append("data", blobToUpload, selectedFile.name);
+
+      try {
+        const res = await fetch("http://localhost:8080/photos", { method: "POST", body: formData });
+        const text = await res.text();
+        if (!res.ok) throw new Error(text || ("HTTP " + res.status));
+        statusEl.textContent = "Uploaded successfully: " + text;
+        console.log(text);
+      } catch (e) {
+        statusEl.textContent = "Upload failed: " + e.message;
+        console.error(e);
+      } finally {
+        uploadButton.disabled = false;
+      }
     }
   </script>
-
 </body>
 </html>
